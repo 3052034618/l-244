@@ -47,23 +47,28 @@ async function start() {
     console.log(`接口概览:`);
     console.log(`  [资产登记] POST   /api/assets            - 按编号创建资产`);
     console.log(`             POST   /api/assets/:id/voucher - 上传凭证信息`);
-    console.log(`             GET    /api/assets/available   - 查询可用资源`);
+    console.log(`             GET    /api/assets/available   - 查询可用资源（支持时间段）`);
     console.log(`             GET    /api/assets             - 资产列表`);
     console.log(`             GET    /api/assets/:id         - 资产详情`);
-    console.log(`  [状态变更] PUT    /api/assets/:id/status   - 变更资产状态`);
-    console.log(`  [预约占用] POST   /api/reservations        - 提交预约`);
+    console.log(`  [状态变更] PUT    /api/assets/:id/status   - 变更资产状态（含联动校验）`);
+    console.log(`  [预约占用] POST   /api/reservations        - 提交预约（严格校验+冲突建议）`);
     console.log(`             PUT    /api/reservations/:id/approve - 审批占用`);
     console.log(`             PUT    /api/reservations/:id/return  - 登记归还`);
     console.log(`             GET    /api/reservations        - 预约列表`);
+    console.log(`             GET    /api/reservations/calendar - 预约日历（双部门筛选）`);
     console.log(`  [保养提醒] POST   /api/maintenance         - 记录保养里程`);
     console.log(`             GET    /api/maintenance/reminders  - 到期提醒`);
     console.log(`             GET    /api/maintenance/:asset_id  - 保养记录`);
+    console.log(`             GET    /api/maintenance/todo-list - 保养待办清单（分组）`);
+    console.log(`             GET    /api/maintenance/:asset_id/history - 待办处理历史`);
+    console.log(`             POST   /api/maintenance/:asset_id/resolve - 处理待办`);
     console.log(`  [处置申请] POST   /api/disposals           - 发起报废/转让`);
-    console.log(`             PUT    /api/disposals/:id/approve  - 审批处置`);
+    console.log(`             PUT    /api/disposals/:id/approve  - 审批处置（含联动校验）`);
     console.log(`             GET    /api/disposals           - 处置列表`);
     console.log(`  [统计查询] GET    /api/stats/department-occupancy - 部门占用率`);
     console.log(`             GET    /api/stats/person-assets       - 人员追踪`);
     console.log(`             GET    /api/stats/asset-logs          - 资产流水`);
+    console.log(`             GET    /api/stats/audit-trail         - 审计视图（状态溯源）`);
   });
 }
 

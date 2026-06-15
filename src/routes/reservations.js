@@ -33,6 +33,141 @@ function updateAssetStatusByReservations(assetId) {
   }
 }
 
+function generateConflictSuggestions(assetId, asset, requestedStart, requestedEnd, conflicts, requestDepartment) {
+  const requestedStartDate = new Date(requestedStart);
+  const requestedEndDate = new Date(requestedEnd);
+  const durationMs = requestedEndDate.getTime() - requestedStartDate.getTime();
+  const durationMins = Math.round(durationMs / (1000 * 60));
+
+  const alternativeTimes = [];
+
+  const sortedConflicts = [...conflicts].sort((a, b) =>
+    new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
+  );
+
+  const firstConflictStart = new Date(sortedConflicts[0].start_time);
+  const gapBefore = firstConflictStart.getTime() - requestedStartDate.getTime();
+  if (gapBefore >= durationMs) {
+    const altEnd = new Date(firstConflictStart.getTime());
+    const altStart = new Date(altEnd.getTime() - durationMs);
+    alternativeTimes.push({
+      type: 'before_conflict',
+      start_time: altStart.toISOString(),
+      end_time: altEnd.toISOString(),
+      description: '冲突前可预约时段',
+      available: true
+    });
+  }
+
+  for (let i = 0; i < sortedConflicts.length - 1; i++) {
+    const currentEnd = new Date(sortedConflicts[i].end_time);
+    const nextStart = new Date(sortedConflicts[i + 1].start_time);
+    const gap = nextStart.getTime() - currentEnd.getTime();
+    if (gap >= durationMs) {
+      const altStart = new Date(currentEnd.getTime());
+      const altEnd = new Date(altStart.getTime() + durationMs);
+      alternativeTimes.push({
+        type: 'between_conflicts',
+        start_time: altStart.toISOString(),
+        end_time: altEnd.toISOString(),
+        description: '冲突间隔可预约时段',
+        available: true
+      });
+    }
+  }
+
+  const lastConflictEnd = new Date(sortedConflicts[sortedConflicts.length - 1].end_time);
+  const altStartAfter = new Date(lastConflictEnd.getTime());
+  const altEndAfter = new Date(altStartAfter.getTime() + durationMs);
+  alternativeTimes.push({
+    type: 'after_conflict',
+    start_time: altStartAfter.toISOString(),
+    end_time: altEndAfter.toISOString(),
+    description: '冲突后可预约时段',
+    available: true
+  });
+
+  const nextDaySameTime = new Date(requestedStartDate);
+  nextDaySameTime.setDate(nextDaySameTime.getDate() + 1);
+  const nextDayEnd = new Date(nextDaySameTime.getTime() + durationMs);
+  alternativeTimes.push({
+    type: 'next_day_same_time',
+    start_time: nextDaySameTime.toISOString(),
+    end_time: nextDayEnd.toISOString(),
+    description: '次日同一时段（建议先校验可用性）',
+    available: null
+  });
+
+  let alternativeAssets = [];
+  try {
+    const dept = requestDepartment || asset.department;
+    let sameDeptAssets = [];
+
+    if (dept && dept !== '???' && dept.trim().length > 0) {
+      sameDeptAssets = all(`
+        SELECT * FROM assets
+        WHERE status NOT IN ('maintenance', 'disposed')
+        AND id != ?
+        AND department = ?
+        ORDER BY department, asset_code
+        LIMIT 10
+      `, [assetId, dept]);
+    }
+
+    if (sameDeptAssets.length === 0) {
+      sameDeptAssets = all(`
+        SELECT * FROM assets
+        WHERE status NOT IN ('maintenance', 'disposed')
+        AND id != ?
+        ORDER BY department, asset_code
+        LIMIT 10
+      `, [assetId]);
+    }
+
+    for (const altAsset of sameDeptAssets) {
+      const altConflicts = all(`
+        SELECT 1 FROM reservations r
+        WHERE r.asset_id = ? AND r.status IN ('pending', 'approved')
+        AND r.start_time < ? AND r.end_time > ?
+        LIMIT 1
+      `, [altAsset.id, requestedEnd, requestedStart]);
+
+      alternativeAssets.push({
+        asset_id: altAsset.id,
+        asset_code: altAsset.asset_code,
+        name: altAsset.name,
+        category: altAsset.category,
+        department: altAsset.department,
+        status: altAsset.status,
+        available_in_requested_time: altConflicts.length === 0,
+        is_same_department: dept && altAsset.department === dept
+      });
+    }
+
+    alternativeAssets.sort((a, b) => {
+      if (a.available_in_requested_time !== b.available_in_requested_time) {
+        return a.available_in_requested_time ? -1 : 1;
+      }
+      if (a.is_same_department !== b.is_same_department) {
+        return a.is_same_department ? -1 : 1;
+      }
+      return 0;
+    });
+  } catch (e) {
+    console.error('查询替代资产失败:', e);
+  }
+
+  return {
+    requested_duration_minutes: durationMins,
+    alternative_times: alternativeTimes.slice(0, 6),
+    alternative_assets: alternativeAssets,
+    tips: [
+      `建议选择上述推荐时段或资产，也可调整预约时长（当前 ${durationMins} 分钟）`,
+      '点击推荐时段可直接尝试再次预约，二次提交前会重新校验可用性'
+    ]
+  };
+}
+
 router.post('/', (req, res) => {
   const { asset_id, applicant, department, purpose, start_time, end_time } = req.body;
 
@@ -104,6 +239,8 @@ router.post('/', (req, res) => {
   `, [asset_id, end_time, start_time]);
 
   if (conflicts.length > 0) {
+    const suggestions = generateConflictSuggestions(asset_id, asset, start_time, end_time, conflicts, department);
+
     return res.status(409).json({
       error: '时段冲突',
       detail: `资产 ${asset.asset_code} 在申请时段内已有 ${conflicts.length} 个预约/审批`,
@@ -115,7 +252,8 @@ router.post('/', (req, res) => {
         status: c.status,
         applicant: c.applicant,
         purpose: c.purpose
-      }))
+      })),
+      suggestions: suggestions
     });
   }
 
@@ -267,7 +405,7 @@ router.get('/', (req, res) => {
 });
 
 router.get('/calendar', (req, res) => {
-  const { asset_id, department, applicant, start_date, end_date } = req.query;
+  const { asset_id, department, asset_department, applicant, start_date, end_date } = req.query;
 
   if (!start_date || !end_date) {
     return res.status(400).json({
@@ -286,10 +424,17 @@ router.get('/calendar', (req, res) => {
     });
   }
 
+  let filterType = 'all';
+  if (asset_department && department) filterType = 'both';
+  else if (asset_department) filterType = 'asset_department';
+  else if (department) filterType = 'request_department';
+
   let assetSql = 'SELECT * FROM assets WHERE status != ?';
   let assetParams = ['disposed'];
   if (asset_id) { assetSql += ' AND id = ?'; assetParams.push(asset_id); }
-  if (department) { assetSql += ' AND department = ?'; assetParams.push(department); }
+  if (asset_department) { assetSql += ' AND department = ?'; assetParams.push(asset_department); }
+  else if (department && filterType === 'request_department') {
+  }
   assetSql += ' ORDER BY department, asset_code';
 
   const assets = all(assetSql, assetParams);
@@ -303,7 +448,14 @@ router.get('/calendar', (req, res) => {
   const resParams = [end_date, start_date];
 
   if (asset_id) { resSql += ' AND r.asset_id = ?'; resParams.push(asset_id); }
-  if (department) { resSql += ' AND r.department = ?'; resParams.push(department); }
+  if (asset_department) {
+    resSql += ' AND a.department = ?';
+    resParams.push(asset_department);
+  }
+  if (department) {
+    resSql += ' AND r.department = ?';
+    resParams.push(department);
+  }
   if (applicant) { resSql += ' AND r.applicant = ?'; resParams.push(applicant); }
   resSql += ' ORDER BY r.start_time ASC';
 
@@ -317,7 +469,7 @@ router.get('/calendar', (req, res) => {
       asset_code: asset.asset_code,
       name: asset.name,
       category: asset.category,
-      department: asset.department,
+      asset_department: asset.department,
       status: asset.status,
       responsible_person: asset.responsible_person,
       events: assetReservations.map(r => ({
@@ -327,7 +479,8 @@ router.get('/calendar', (req, res) => {
         end: r.end_time,
         status: r.status,
         applicant: r.applicant,
-        department: r.department,
+        request_department: r.department,
+        asset_department: r.asset_department,
         purpose: r.purpose,
         backgroundColor: r.status === 'approved' ? '#3b82f6'
           : r.status === 'pending' ? '#f59e0b'
@@ -354,7 +507,8 @@ router.get('/calendar', (req, res) => {
     asset_code: r.asset_code,
     asset_name: r.asset_name,
     applicant: r.applicant,
-    department: r.department,
+    request_department: r.department,
+    asset_department: r.asset_department,
     purpose: r.purpose,
     backgroundColor: r.status === 'approved' ? '#3b82f6'
       : r.status === 'pending' ? '#f59e0b'
@@ -367,6 +521,9 @@ router.get('/calendar', (req, res) => {
 
   res.json({
     range: { start: start_date, end: end_date },
+    filter_type: filterType,
+    asset_department: asset_department || null,
+    request_department: department || null,
     assets: Array.from(assetMap.values()),
     events: calendarEvents,
     summary: {

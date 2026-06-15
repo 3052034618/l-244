@@ -11,6 +11,7 @@ function calcMaintenanceStatus(asset, nowStr) {
   let overdueDays = 0;
   let daysToNext = null;
   let mileageOver = 0;
+  let mileageToNext = null;
 
   if (asset.next_maintenance_date) {
     const nextDate = new Date(asset.next_maintenance_date);
@@ -30,10 +31,10 @@ function calcMaintenanceStatus(asset, nowStr) {
     }
   }
 
-  if (asset.next_maintenance_mileage && asset.mileage !== null) {
+  if (asset.next_maintenance_mileage !== null && asset.next_maintenance_mileage !== undefined && asset.mileage !== null && asset.mileage !== undefined) {
     const diff = asset.next_maintenance_mileage - asset.mileage;
     mileageOver = diff < 0 ? Math.abs(diff) : 0;
-    const mileageToNext = diff > 0 ? diff : 0;
+    mileageToNext = diff > 0 ? diff : 0;
 
     if (diff <= 0) {
       statuses.push('overdue_mileage');
@@ -47,7 +48,59 @@ function calcMaintenanceStatus(asset, nowStr) {
     }
   }
 
-  return { statuses, level, overdueDays, daysToNext, mileageOver, mileageToNext: asset.next_maintenance_mileage ? asset.mileage ? asset.next_maintenance_mileage - asset.mileage : null : null };
+  let riskScore = 0;
+  if (level === 'overdue') riskScore = 100;
+  else if (level === 'urgent') riskScore = 70;
+  else if (level === 'soon') riskScore = 40;
+  else riskScore = 10;
+
+  let riskDescription = '正常维护';
+  if (statuses.includes('overdue_date')) riskDescription = '日期已逾期，需立即处理';
+  else if (statuses.includes('overdue_mileage')) riskDescription = '里程已超限，需立即处理';
+  else if (statuses.includes('urgent_date') || statuses.includes('urgent_mileage')) riskDescription = '即将到期，需尽快安排';
+  else if (statuses.includes('soon_date') || statuses.includes('soon_mileage')) riskDescription = '近期到期，可提前规划';
+
+  return {
+    statuses,
+    level,
+    risk_score: riskScore,
+    risk_description: riskDescription,
+    overdueDays,
+    daysToNext,
+    mileageOver,
+    mileageToNext,
+    current_mileage: asset.mileage,
+    target_mileage: asset.next_maintenance_mileage
+  };
+}
+
+function getMaintenanceTodoHistory(assetId) {
+  return all(`
+    SELECT id, action, operator, detail, created_at
+    FROM asset_logs
+    WHERE asset_id = ? AND action = 'maintenance_todo'
+    ORDER BY created_at DESC
+  `, [assetId]);
+}
+
+function getAssetTodoStatus(assetId) {
+  const logs = getMaintenanceTodoHistory(assetId);
+  if (logs.length === 0) return { latest_action: null, latest_operator: null, latest_time: null, action_count: 0 };
+
+  const latest = logs[0];
+  let actionType = 'unknown';
+  if (latest.detail && latest.detail.includes('已安排')) actionType = 'scheduled';
+  else if (latest.detail && latest.detail.includes('暂缓')) actionType = 'deferred';
+  else if (latest.detail && latest.detail.includes('已完成')) actionType = 'completed';
+
+  return {
+    latest_action: actionType,
+    latest_operator: latest.operator,
+    latest_time: latest.created_at,
+    latest_remark: latest.detail,
+    action_count: logs.length,
+    history: logs
+  };
 }
 
 router.post('/', (req, res) => {
@@ -138,7 +191,7 @@ router.get('/reminders', (req, res) => {
 });
 
 router.get('/todo-list', (req, res) => {
-  const { group_by, department, responsible_person, category, level } = req.query;
+  const { group_by, department, responsible_person, category, level, include_history } = req.query;
 
   const nowStr = new Date().toISOString();
   const now = new Date();
@@ -167,6 +220,8 @@ router.get('/todo-list', (req, res) => {
     }
 
     const reasons = [];
+    const mileageDetails = {};
+
     if (status.statuses.includes('overdue_date')) {
       reasons.push(`日期已逾期 ${status.overdueDays} 天（应于 ${asset.next_maintenance_date}）`);
     }
@@ -177,16 +232,36 @@ router.get('/todo-list', (req, res) => {
       reasons.push(`日期快到期（${status.daysToNext} 天后，${asset.next_maintenance_date}）`);
     }
     if (status.statuses.includes('overdue_mileage')) {
-      reasons.push(`里程已超 ${status.mileageOver} km（当前 ${asset.mileage}，阈值 ${asset.next_maintenance_mileage}）`);
+      reasons.push(`里程已超 ${status.mileageOver} km（当前 ${asset.mileage} km，阈值 ${asset.next_maintenance_mileage} km）`);
+      mileageDetails.status = 'overdue';
+      mileageDetails.remaining = -status.mileageOver;
+      mileageDetails.remaining_text = `已超 ${status.mileageOver} km`;
     }
     if (status.statuses.includes('urgent_mileage')) {
-      reasons.push(`里程即将到达（还差 ${status.mileage_to_next} km，当前 ${asset.mileage}）`);
+      reasons.push(`里程即将到达（还差 ${status.mileageToNext} km，当前 ${asset.mileage} km，阈值 ${asset.next_maintenance_mileage} km）`);
+      mileageDetails.status = 'urgent';
+      mileageDetails.remaining = status.mileageToNext;
+      mileageDetails.remaining_text = `还差 ${status.mileageToNext} km`;
     }
     if (status.statuses.includes('soon_mileage')) {
-      reasons.push(`里程快到期（还差 ${status.mileage_to_next} km，当前 ${asset.mileage}）`);
+      reasons.push(`里程快到期（还差 ${status.mileageToNext} km，当前 ${asset.mileage} km，阈值 ${asset.next_maintenance_mileage} km）`);
+      mileageDetails.status = 'soon';
+      mileageDetails.remaining = status.mileageToNext;
+      mileageDetails.remaining_text = `还差 ${status.mileageToNext} km`;
     }
 
-    return {
+    if (asset.mileage !== null && asset.next_maintenance_mileage !== null && Object.keys(mileageDetails).length === 0) {
+      mileageDetails.status = 'normal';
+      mileageDetails.remaining = status.mileageToNext;
+      mileageDetails.remaining_text = `还差 ${status.mileageToNext} km`;
+    }
+
+    mileageDetails.current = asset.mileage;
+    mileageDetails.target = asset.next_maintenance_mileage;
+
+    const todoStatus = getAssetTodoStatus(asset.id);
+
+    const result = {
       asset_id: asset.id,
       asset_code: asset.asset_code,
       name: asset.name,
@@ -194,18 +269,34 @@ router.get('/todo-list', (req, res) => {
       brand: asset.brand,
       department: asset.department,
       responsible_person: asset.responsible_person,
-      status: asset.status,
+      asset_status: asset.status,
       mileage: asset.mileage,
       next_maintenance_date: asset.next_maintenance_date,
       next_maintenance_mileage: asset.next_maintenance_mileage,
       urgency_level: status.level,
+      risk_score: status.risk_score,
+      risk_description: status.risk_description,
       needs_attention: needsAttention,
       todo_reasons: reasons,
       overdue_days: status.overdueDays,
       days_to_next: status.daysToNext,
       mileage_over: status.mileageOver,
-      mileage_to_next: status.mileage_to_next
+      mileage_to_next: status.mileageToNext,
+      mileage_details: mileageDetails,
+      todo_status: {
+        latest_action: todoStatus.latest_action,
+        latest_operator: todoStatus.latest_operator,
+        latest_time: todoStatus.latest_time,
+        latest_remark: todoStatus.latest_remark,
+        action_count: todoStatus.action_count
+      }
     };
+
+    if (include_history === 'true' || include_history === '1') {
+      result.todo_status.history = todoStatus.history;
+    }
+
+    return result;
   }).filter(x => x !== null);
 
   const urgentItems = items.filter(x => x.urgency_level === 'urgent').sort((a, b) => {
@@ -252,12 +343,19 @@ router.get('/todo-list', (req, res) => {
           urgent: 0,
           soon: 0,
           normal: 0,
+          pending_action: 0,
+          scheduled: 0,
+          deferred: 0,
+          completed: 0,
           items: []
         });
       }
       const d = deptMap.get(dept);
       d.total++;
       d[item.urgency_level]++;
+      const action = item.todo_status.latest_action;
+      if (!action) d.pending_action++;
+      else if (d[action] !== undefined) d[action]++;
       d.items.push(item);
     }
     grouped.by_department = Array.from(deptMap.values());
@@ -276,18 +374,55 @@ router.get('/todo-list', (req, res) => {
           urgent: 0,
           soon: 0,
           normal: 0,
+          pending_action: 0,
+          scheduled: 0,
+          deferred: 0,
+          completed: 0,
           items: []
         });
       }
       const p = personMap.get(person);
       p.total++;
       p[item.urgency_level]++;
+      const action = item.todo_status.latest_action;
+      if (!action) p.pending_action++;
+      else if (p[action] !== undefined) p[action]++;
       p.items.push(item);
     }
     grouped.by_person = Array.from(personMap.values());
   }
 
+  grouped.action_counts = {
+    pending_action: items.filter(x => !x.todo_status.latest_action).length,
+    scheduled: items.filter(x => x.todo_status.latest_action === 'scheduled').length,
+    deferred: items.filter(x => x.todo_status.latest_action === 'deferred').length,
+    completed: items.filter(x => x.todo_status.latest_action === 'completed').length
+  };
+
   res.json({ data: grouped });
+});
+
+router.get('/:asset_id/history', (req, res) => {
+  const { asset_id } = req.params;
+
+  const asset = get('SELECT * FROM assets WHERE id = ?', [asset_id]);
+  if (!asset) {
+    return res.status(404).json({ error: '资产不存在', code: 'ASSET_NOT_FOUND' });
+  }
+
+  const history = getMaintenanceTodoHistory(asset_id);
+  const nowStr = new Date().toISOString();
+  const status = calcMaintenanceStatus(asset, nowStr);
+
+  res.json({
+    data: {
+      asset_id,
+      asset_code: asset.asset_code,
+      name: asset.name,
+      maintenance_status: status,
+      history: history
+    }
+  });
 });
 
 router.post('/:asset_id/resolve', (req, res) => {
