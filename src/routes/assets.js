@@ -93,26 +93,93 @@ router.post('/:id/voucher', upload.single('file'), (req, res) => {
 router.get('/available', (req, res) => {
   const { category, department, start_time, end_time } = req.query;
 
-  let sql = 'SELECT * FROM assets WHERE status = ?';
-  const params = ['idle'];
+  if (start_time && end_time) {
+    const start = new Date(start_time);
+    const end = new Date(end_time);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'start_time 或 end_time 格式无效' });
+    }
+    if (start >= end) {
+      return res.status(400).json({ error: 'end_time 必须晚于 start_time' });
+    }
+  }
+
+  let sql = 'SELECT * FROM assets WHERE status != ? AND status != ?';
+  const params = ['maintenance', 'disposed'];
 
   if (category) { sql += ' AND category = ?'; params.push(category); }
   if (department) { sql += ' AND department = ?'; params.push(department); }
 
+  sql += ' ORDER BY created_at DESC';
+
   let assets = all(sql, params);
+  const now = new Date().toISOString();
+
+  const result = assets.map(asset => {
+    let isAvailable = true;
+    let conflicts = [];
+    let currentOccupation = null;
+
+    const checkStart = start_time || now;
+    const checkEnd = end_time || now;
+
+    const overlapping = all(`
+      SELECT r.*, a.asset_code, a.name as asset_name
+      FROM reservations r LEFT JOIN assets a ON r.asset_id = a.id
+      WHERE r.asset_id = ? AND r.status IN ('pending', 'approved')
+      AND r.start_time < ? AND r.end_time > ?
+      ORDER BY r.start_time ASC
+    `, [asset.id, checkEnd, checkStart]);
+
+    if (overlapping.length > 0) {
+      isAvailable = false;
+      conflicts = overlapping.map(r => ({
+        reservation_id: r.id,
+        start_time: r.start_time,
+        end_time: r.end_time,
+        status: r.status,
+        applicant: r.applicant,
+        department: r.department,
+        purpose: r.purpose
+      }));
+    }
+
+    const current = get(`
+      SELECT r.* FROM reservations r
+      WHERE r.asset_id = ? AND r.status = 'approved'
+      AND r.start_time <= ? AND r.end_time >= ?
+    `, [asset.id, now, now]);
+
+    if (current) {
+      currentOccupation = {
+        reservation_id: current.id,
+        start_time: current.start_time,
+        end_time: current.end_time,
+        applicant: current.applicant,
+        department: current.department,
+        purpose: current.purpose
+      };
+    }
+
+    return {
+      ...asset,
+      available: isAvailable,
+      conflicts,
+      current_occupation: currentOccupation
+    };
+  });
 
   if (start_time && end_time) {
-    assets = assets.filter(asset => {
-      const conflict = get(`
-        SELECT 1 FROM reservations
-        WHERE asset_id = ? AND status IN ('pending', 'approved')
-        AND start_time < ? AND end_time > ?
-      `, [asset.id, end_time, start_time]);
-      return !conflict;
+    const filtered = result.filter(a => a.available);
+    res.json({
+      data: filtered,
+      query_range: { start_time, end_time },
+      total_count: assets.length,
+      available_count: filtered.length
     });
+  } else {
+    res.json({ data: result });
   }
-
-  res.json({ data: assets });
 });
 
 router.get('/:id', (req, res) => {

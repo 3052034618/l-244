@@ -4,6 +4,40 @@ const { run, get, all, addLog } = require('../db');
 
 const router = express.Router();
 
+function hasActiveOccupation(assetId) {
+  const now = new Date().toISOString();
+  return get(`
+    SELECT r.* FROM reservations r
+    WHERE r.asset_id = ? AND r.status = 'approved'
+    AND r.start_time <= ? AND r.end_time >= ?
+  `, [assetId, now, now]);
+}
+
+function cancelPendingAndFutureReservations(assetId, reason, operator) {
+  const now = new Date().toISOString();
+  const affected = all(`
+    SELECT * FROM reservations
+    WHERE asset_id = ? AND status IN ('pending', 'approved')
+    AND end_time > ?
+  `, [assetId, now]);
+
+  if (affected.length === 0) return [];
+
+  run(`
+    UPDATE reservations
+    SET status = 'cancelled', updated_at = datetime('now')
+    WHERE asset_id = ? AND status IN ('pending', 'approved')
+    AND end_time > ?
+  `, [assetId, now]);
+
+  for (const r of affected) {
+    addLog(assetId, 'reservation_cancelled', operator || 'system',
+      `预约${r.status === 'approved' ? '审批通过' : '待审批'}已取消，原因: ${reason}，原时段: ${r.start_time} ~ ${r.end_time}`);
+  }
+
+  return affected;
+}
+
 router.post('/', (req, res) => {
   const { asset_id, disposal_type, reason, applicant, department } = req.body;
 
@@ -49,38 +83,82 @@ router.put('/:id/approve', (req, res) => {
   const { approved, approved_by, remark } = req.body;
 
   if (typeof approved !== 'boolean') {
-    return res.status(400).json({ error: 'approved (boolean) 为必填项' });
+    return res.status(400).json({
+      error: '参数错误',
+      detail: 'approved (boolean) 为必填项',
+      code: 'INVALID_PARAMS'
+    });
   }
 
   const request = get('SELECT * FROM disposal_requests WHERE id = ?', [id]);
-  if (!request) return res.status(404).json({ error: '处置申请不存在' });
+  if (!request) {
+    return res.status(404).json({
+      error: '处置申请不存在',
+      code: 'REQUEST_NOT_FOUND'
+    });
+  }
 
   if (request.status !== 'pending') {
-    return res.status(400).json({ error: '仅待审批处置申请可操作' });
+    return res.status(400).json({
+      error: '状态错误',
+      detail: `仅待审批(pending)的处置申请可操作，当前状态: ${request.status}`,
+      code: 'INVALID_STATUS'
+    });
   }
 
   const newStatus = approved ? 'approved' : 'rejected';
+  let cancelledReservations = [];
+
+  if (approved) {
+    const activeOccupation = hasActiveOccupation(request.asset_id);
+    if (activeOccupation) {
+      return res.status(400).json({
+        error: '存在生效占用',
+        detail: `资产当前正在被使用（预约 ${activeOccupation.id}），请先归还再处置`,
+        code: 'ACTIVE_OCCUPATION_EXISTS',
+        current_occupation: {
+          reservation_id: activeOccupation.id,
+          applicant: activeOccupation.applicant,
+          start_time: activeOccupation.start_time,
+          end_time: activeOccupation.end_time
+        }
+      });
+    }
+
+    const asset = get('SELECT * FROM assets WHERE id = ?', [request.asset_id]);
+    const disposalName = request.disposal_type === 'scrap' ? '报废' : '转让';
+
+    cancelledReservations = cancelPendingAndFutureReservations(
+      request.asset_id,
+      `资产已${disposalName}（处置申请 ${id}）`,
+      approved_by
+    );
+
+    run(`UPDATE assets SET status = 'disposed', updated_at = datetime('now') WHERE id = ?`, [request.asset_id]);
+
+    addLog(request.asset_id, 'status_change', approved_by || 'system',
+      `状态变更: ${asset.status} -> disposed，原因: ${disposalName}处置${remark ? '，备注: ' + remark : ''}`);
+  }
+
   run(`
     UPDATE disposal_requests
     SET status = ?, approved_by = ?, approved_at = datetime('now'), updated_at = datetime('now')
     WHERE id = ?
   `, [newStatus, approved_by || null, id]);
 
-  if (approved) {
-    run(`UPDATE assets SET status = 'disposed', updated_at = datetime('now') WHERE id = ?`, [request.asset_id]);
-
-    run(`
-      UPDATE reservations SET status = 'cancelled', updated_at = datetime('now')
-      WHERE asset_id = ? AND status IN ('pending', 'approved')
-    `, [request.asset_id]);
-  }
-
+  const disposalName = request.disposal_type === 'scrap' ? '报废' : '转让';
   addLog(request.asset_id, approved ? 'disposal_approved' : 'disposal_rejected',
     approved_by || 'system',
-    `处置${approved ? '通过' : '拒绝'}: ${request.disposal_type === 'scrap' ? '报废' : '转让'}${remark ? '，备注: ' + remark : ''}`);
+    `处置${approved ? '通过' : '拒绝'}: ${disposalName}${remark ? '，备注: ' + remark : ''}`);
 
   const updated = get('SELECT * FROM disposal_requests WHERE id = ?', [id]);
-  res.json({ message: approved ? '处置审批通过' : '处置审批拒绝', data: updated });
+  res.json({
+    message: approved ? '处置审批通过' : '处置审批拒绝',
+    data: updated,
+    affected: {
+      cancelled_reservations: cancelledReservations
+    }
+  });
 });
 
 router.get('/', (req, res) => {

@@ -4,32 +4,119 @@ const { run, get, all, addLog } = require('../db');
 
 const router = express.Router();
 
+function hasActiveOccupation(assetId) {
+  const now = new Date().toISOString();
+  return get(`
+    SELECT r.* FROM reservations r
+    WHERE r.asset_id = ? AND r.status = 'approved'
+    AND r.start_time <= ? AND r.end_time >= ?
+  `, [assetId, now, now]);
+}
+
+function updateAssetStatusByReservations(assetId) {
+  const now = new Date().toISOString();
+
+  const active = get(`
+    SELECT 1 FROM reservations r
+    WHERE r.asset_id = ? AND r.status = 'approved'
+    AND r.start_time <= ? AND r.end_time >= ?
+  `, [assetId, now, now]);
+
+  const asset = get('SELECT status FROM assets WHERE id = ?', [assetId]);
+  if (!asset || asset.status === 'maintenance' || asset.status === 'disposed') {
+    return;
+  }
+
+  const newStatus = active ? 'in_use' : 'idle';
+  if (asset.status !== newStatus) {
+    run(`UPDATE assets SET status = ?, updated_at = datetime('now') WHERE id = ?`, [newStatus, assetId]);
+  }
+}
+
 router.post('/', (req, res) => {
   const { asset_id, applicant, department, purpose, start_time, end_time } = req.body;
 
   if (!asset_id || !applicant || !department || !start_time || !end_time) {
-    return res.status(400).json({ error: 'asset_id、applicant、department、start_time、end_time 为必填项' });
+    return res.status(400).json({
+      error: '参数缺失',
+      detail: 'asset_id、applicant、department、start_time、end_time 为必填项',
+      code: 'MISSING_PARAMS'
+    });
   }
 
-  if (new Date(start_time) >= new Date(end_time)) {
-    return res.status(400).json({ error: '结束时间必须晚于开始时间' });
+  const start = new Date(start_time);
+  const end = new Date(end_time);
+
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return res.status(400).json({
+      error: '时间格式错误',
+      detail: 'start_time 和 end_time 必须是有效的 ISO 时间字符串（如 2026-06-20T09:00:00）',
+      code: 'INVALID_TIME_FORMAT'
+    });
+  }
+
+  if (start >= end) {
+    return res.status(400).json({
+      error: '时间范围错误',
+      detail: 'end_time 必须严格晚于 start_time',
+      code: 'INVALID_TIME_RANGE'
+    });
+  }
+
+  if (end.getTime() - start.getTime() < 5 * 60 * 1000) {
+    return res.status(400).json({
+      error: '时间范围过短',
+      detail: '预约时长不能少于 5 分钟',
+      code: 'TIME_RANGE_TOO_SHORT'
+    });
   }
 
   const asset = get('SELECT * FROM assets WHERE id = ?', [asset_id]);
-  if (!asset) return res.status(404).json({ error: '资产不存在' });
-
-  if (asset.status === 'disposed') {
-    return res.status(400).json({ error: '已处置资产不可预约' });
+  if (!asset) {
+    return res.status(404).json({
+      error: '资产不存在',
+      detail: `未找到 ID 为 ${asset_id} 的资产`,
+      code: 'ASSET_NOT_FOUND'
+    });
   }
 
-  const conflict = get(`
-    SELECT 1 FROM reservations
-    WHERE asset_id = ? AND status IN ('pending', 'approved')
-    AND start_time < ? AND end_time > ?
+  if (asset.status === 'disposed') {
+    return res.status(400).json({
+      error: '资产已处置',
+      detail: `资产 ${asset.asset_code} 已处置，不可预约`,
+      code: 'ASSET_DISPOSED'
+    });
+  }
+
+  if (asset.status === 'maintenance') {
+    return res.status(400).json({
+      error: '资产保养中',
+      detail: `资产 ${asset.asset_code} 正在保养，暂不可预约`,
+      code: 'ASSET_MAINTENANCE'
+    });
+  }
+
+  const conflicts = all(`
+    SELECT r.* FROM reservations r
+    WHERE r.asset_id = ? AND r.status IN ('pending', 'approved')
+    AND r.start_time < ? AND r.end_time > ?
+    ORDER BY r.start_time ASC
   `, [asset_id, end_time, start_time]);
 
-  if (conflict) {
-    return res.status(409).json({ error: '该时段资产已被预约' });
+  if (conflicts.length > 0) {
+    return res.status(409).json({
+      error: '时段冲突',
+      detail: `资产 ${asset.asset_code} 在申请时段内已有 ${conflicts.length} 个预约/审批`,
+      code: 'TIME_CONFLICT',
+      conflicts: conflicts.map(c => ({
+        reservation_id: c.id,
+        start_time: c.start_time,
+        end_time: c.end_time,
+        status: c.status,
+        applicant: c.applicant,
+        purpose: c.purpose
+      }))
+    });
   }
 
   const id = uuidv4();
@@ -38,7 +125,8 @@ router.post('/', (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `, [id, asset_id, applicant, department, purpose || null, start_time, end_time]);
 
-  addLog(asset_id, 'reserve', applicant, `提交预约 ${start_time} ~ ${end_time}`);
+  addLog(asset_id, 'reserve', applicant,
+    `提交预约 ${start_time} ~ ${end_time}${purpose ? '，用途: ' + purpose : ''}`);
 
   const reservation = get('SELECT * FROM reservations WHERE id = ?', [id]);
   res.status(201).json({ message: '预约提交成功', data: reservation });
@@ -49,14 +137,36 @@ router.put('/:id/approve', (req, res) => {
   const { approved, approved_by, remark } = req.body;
 
   if (typeof approved !== 'boolean') {
-    return res.status(400).json({ error: 'approved (boolean) 为必填项' });
+    return res.status(400).json({
+      error: '参数错误',
+      detail: 'approved (boolean) 为必填项',
+      code: 'INVALID_PARAMS'
+    });
   }
 
   const reservation = get('SELECT * FROM reservations WHERE id = ?', [id]);
-  if (!reservation) return res.status(404).json({ error: '预约不存在' });
+  if (!reservation) {
+    return res.status(404).json({
+      error: '预约不存在',
+      code: 'RESERVATION_NOT_FOUND'
+    });
+  }
 
   if (reservation.status !== 'pending') {
-    return res.status(400).json({ error: '仅待审批预约可操作' });
+    return res.status(400).json({
+      error: '状态错误',
+      detail: `仅待审批(pending)的预约可操作，当前状态: ${reservation.status}`,
+      code: 'INVALID_STATUS'
+    });
+  }
+
+  const asset = get('SELECT status FROM assets WHERE id = ?', [reservation.asset_id]);
+  if (!asset || asset.status === 'disposed' || asset.status === 'maintenance') {
+    return res.status(400).json({
+      error: '资产状态异常',
+      detail: `资产当前状态为 ${asset ? asset.status : '不存在'}，无法审批`,
+      code: 'ASSET_STATUS_INVALID'
+    });
   }
 
   const newStatus = approved ? 'approved' : 'rejected';
@@ -67,7 +177,7 @@ router.put('/:id/approve', (req, res) => {
   `, [newStatus, approved_by || null, id]);
 
   if (approved) {
-    run(`UPDATE assets SET status = 'in_use', updated_at = datetime('now') WHERE id = ?`, [reservation.asset_id]);
+    updateAssetStatusByReservations(reservation.asset_id);
   }
 
   addLog(reservation.asset_id, approved ? 'approve' : 'reject', approved_by || 'system',
@@ -79,33 +189,66 @@ router.put('/:id/approve', (req, res) => {
 
 router.put('/:id/return', (req, res) => {
   const { id } = req.params;
-  const { operator, return_remark } = req.body;
+  const { operator, return_remark, return_time } = req.body;
 
   const reservation = get('SELECT * FROM reservations WHERE id = ?', [id]);
-  if (!reservation) return res.status(404).json({ error: '预约不存在' });
+  if (!reservation) {
+    return res.status(404).json({
+      error: '预约不存在',
+      code: 'RESERVATION_NOT_FOUND'
+    });
+  }
 
   if (reservation.status !== 'approved') {
-    return res.status(400).json({ error: '仅已通过预约可归还' });
+    return res.status(400).json({
+      error: '状态错误',
+      detail: `仅已通过(approved)的预约可归还，当前状态: ${reservation.status}`,
+      code: 'INVALID_STATUS'
+    });
   }
+
+  const now = new Date();
+  const resStart = new Date(reservation.start_time);
+  const resEnd = new Date(reservation.end_time);
+  const nowIso = return_time || now.toISOString();
+
+  if (now < resStart) {
+    return res.status(400).json({
+      error: '归还过早',
+      detail: `预约尚未开始（开始时间: ${reservation.start_time}）`,
+      code: 'TOO_EARLY_TO_RETURN'
+    });
+  }
+
+  const actualReturnTime = new Date(nowIso);
+  const isLate = actualReturnTime > resEnd;
 
   run(`
     UPDATE reservations
-    SET status = 'returned', returned_at = datetime('now'),
+    SET status = 'returned', returned_at = ?,
         return_remark = ?, updated_at = datetime('now')
     WHERE id = ?
-  `, [return_remark || null, id]);
+  `, [nowIso, return_remark || null, id]);
 
-  run(`UPDATE assets SET status = 'idle', updated_at = datetime('now') WHERE id = ?`, [reservation.asset_id]);
+  updateAssetStatusByReservations(reservation.asset_id);
 
+  const remark = return_remark ? `，备注: ${return_remark}` : '';
+  const lateRemark = isLate ? `，逾期归还（应还: ${reservation.end_time}）` : '';
   addLog(reservation.asset_id, 'return', operator || 'system',
-    `归还资产${return_remark ? '，备注: ' + return_remark : ''}`);
+    `归还资产${remark}${lateRemark}`);
 
   const updated = get('SELECT * FROM reservations WHERE id = ?', [id]);
-  res.json({ message: '归还登记成功', data: updated });
+  res.json({
+    message: '归还登记成功',
+    data: {
+      ...updated,
+      is_late: isLate
+    }
+  });
 });
 
 router.get('/', (req, res) => {
-  const { asset_id, applicant, department, status } = req.query;
+  const { asset_id, applicant, department, status, start_from, end_before } = req.query;
 
   let sql = 'SELECT * FROM reservations WHERE 1=1';
   const params = [];
@@ -114,11 +257,126 @@ router.get('/', (req, res) => {
   if (applicant) { sql += ' AND applicant = ?'; params.push(applicant); }
   if (department) { sql += ' AND department = ?'; params.push(department); }
   if (status) { sql += ' AND status = ?'; params.push(status); }
+  if (start_from) { sql += ' AND start_time >= ?'; params.push(start_from); }
+  if (end_before) { sql += ' AND end_time <= ?'; params.push(end_before); }
 
-  sql += ' ORDER BY created_at DESC';
+  sql += ' ORDER BY start_time DESC';
 
   const reservations = all(sql, params);
   res.json({ data: reservations });
+});
+
+router.get('/calendar', (req, res) => {
+  const { asset_id, department, applicant, start_date, end_date } = req.query;
+
+  if (!start_date || !end_date) {
+    return res.status(400).json({
+      error: '参数缺失',
+      detail: 'start_date 和 end_date 为必填项',
+      code: 'MISSING_PARAMS'
+    });
+  }
+
+  const start = new Date(start_date);
+  const end = new Date(end_date);
+  if (isNaN(start.getTime()) || isNaN(end.getTime()) || start >= end) {
+    return res.status(400).json({
+      error: '时间范围无效',
+      code: 'INVALID_TIME_RANGE'
+    });
+  }
+
+  let assetSql = 'SELECT * FROM assets WHERE status != ?';
+  let assetParams = ['disposed'];
+  if (asset_id) { assetSql += ' AND id = ?'; assetParams.push(asset_id); }
+  if (department) { assetSql += ' AND department = ?'; assetParams.push(department); }
+  assetSql += ' ORDER BY department, asset_code';
+
+  const assets = all(assetSql, assetParams);
+
+  let resSql = `
+    SELECT r.*, a.asset_code, a.name as asset_name, a.category, a.department as asset_department
+    FROM reservations r LEFT JOIN assets a ON r.asset_id = a.id
+    WHERE r.start_time < ? AND r.end_time > ?
+    AND r.status IN ('pending', 'approved', 'returned')
+  `;
+  const resParams = [end_date, start_date];
+
+  if (asset_id) { resSql += ' AND r.asset_id = ?'; resParams.push(asset_id); }
+  if (department) { resSql += ' AND r.department = ?'; resParams.push(department); }
+  if (applicant) { resSql += ' AND r.applicant = ?'; resParams.push(applicant); }
+  resSql += ' ORDER BY r.start_time ASC';
+
+  const reservations = all(resSql, resParams);
+
+  const assetMap = new Map();
+  for (const asset of assets) {
+    const assetReservations = reservations.filter(r => r.asset_id === asset.id);
+    assetMap.set(asset.id, {
+      asset_id: asset.id,
+      asset_code: asset.asset_code,
+      name: asset.name,
+      category: asset.category,
+      department: asset.department,
+      status: asset.status,
+      responsible_person: asset.responsible_person,
+      events: assetReservations.map(r => ({
+        id: r.id,
+        title: `${r.applicant}${r.purpose ? ' - ' + r.purpose : ''}`,
+        start: r.start_time,
+        end: r.end_time,
+        status: r.status,
+        applicant: r.applicant,
+        department: r.department,
+        purpose: r.purpose,
+        backgroundColor: r.status === 'approved' ? '#3b82f6'
+          : r.status === 'pending' ? '#f59e0b'
+          : r.status === 'returned' ? '#10b981'
+          : r.status === 'rejected' ? '#ef4444'
+          : '#6b7280',
+        borderColor: 'transparent',
+        allDay: false,
+        extendedProps: {
+          asset_code: r.asset_code,
+          asset_name: r.asset_name
+        }
+      }))
+    });
+  }
+
+  const calendarEvents = reservations.map(r => ({
+    id: r.id,
+    title: `${r.asset_code} - ${r.applicant}${r.purpose ? ' - ' + r.purpose : ''}`,
+    start: r.start_time,
+    end: r.end_time,
+    status: r.status,
+    asset_id: r.asset_id,
+    asset_code: r.asset_code,
+    asset_name: r.asset_name,
+    applicant: r.applicant,
+    department: r.department,
+    purpose: r.purpose,
+    backgroundColor: r.status === 'approved' ? '#3b82f6'
+      : r.status === 'pending' ? '#f59e0b'
+      : r.status === 'returned' ? '#10b981'
+      : r.status === 'rejected' ? '#ef4444'
+      : '#6b7280',
+    borderColor: 'transparent',
+    allDay: false
+  }));
+
+  res.json({
+    range: { start: start_date, end: end_date },
+    assets: Array.from(assetMap.values()),
+    events: calendarEvents,
+    summary: {
+      total_assets: assets.length,
+      total_events: reservations.length,
+      approved: reservations.filter(r => r.status === 'approved').length,
+      pending: reservations.filter(r => r.status === 'pending').length,
+      returned: reservations.filter(r => r.status === 'returned').length
+    }
+  });
 });
 
 module.exports = router;
