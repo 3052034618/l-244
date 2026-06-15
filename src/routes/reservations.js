@@ -13,13 +13,15 @@ function hasActiveOccupation(assetId) {
   `, [assetId, now, now]);
 }
 
-function updateAssetStatusByReservations(assetId) {
+function updateAssetStatusByReservations(assetId, operator = 'system', reservationId = null) {
   const now = new Date().toISOString();
 
   const active = get(`
-    SELECT 1 FROM reservations r
+    SELECT r.* FROM reservations r
     WHERE r.asset_id = ? AND r.status = 'approved'
     AND r.start_time <= ? AND r.end_time >= ?
+    ORDER BY r.start_time ASC
+    LIMIT 1
   `, [assetId, now, now]);
 
   const asset = get('SELECT status FROM assets WHERE id = ?', [assetId]);
@@ -30,7 +32,50 @@ function updateAssetStatusByReservations(assetId) {
   const newStatus = active ? 'in_use' : 'idle';
   if (asset.status !== newStatus) {
     run(`UPDATE assets SET status = ?, updated_at = datetime('now') WHERE id = ?`, [newStatus, assetId]);
+
+    let reason = '';
+    if (newStatus === 'in_use') {
+      const effectiveId = active ? active.id : reservationId;
+      reason = `预约${effectiveId || ''}已生效`;
+      if (active) {
+        reason += `，申请人: ${active.applicant}，时段: ${active.start_time} ~ ${active.end_time}`;
+      }
+    } else {
+      const endingId = reservationId || (active ? active.id : null);
+      reason = `预约${endingId || ''}已归还/结束`;
+      if (active) {
+        reason += `，申请人: ${active.applicant}`;
+      }
+    }
+
+    const relatedId = reservationId || (active ? active.id : null);
+    addLog(assetId, 'status_change', operator,
+      `状态变更: ${asset.status} -> ${newStatus}，原因: ${reason}${relatedId ? '，关联预约: ' + relatedId : ''}`);
   }
+}
+
+function isTimeSlotAvailable(assetId, startTime, endTime, excludeReservationId = null) {
+  const params = [assetId, endTime, startTime];
+  let excludeSql = '';
+  if (excludeReservationId) {
+    excludeSql = 'AND id != ?';
+    params.push(excludeReservationId);
+  }
+
+  const conflicts = all(`
+    SELECT 1 FROM reservations r
+    WHERE r.asset_id = ? AND r.status IN ('pending', 'approved')
+    AND r.start_time < ? AND r.end_time > ?
+    ${excludeSql}
+    LIMIT 1
+  `, params);
+
+  const asset = get('SELECT status FROM assets WHERE id = ?', [assetId]);
+  if (!asset || asset.status === 'maintenance' || asset.status === 'disposed') {
+    return false;
+  }
+
+  return conflicts.length === 0;
 }
 
 function generateConflictSuggestions(assetId, asset, requestedStart, requestedEnd, conflicts, requestDepartment) {
@@ -39,7 +84,7 @@ function generateConflictSuggestions(assetId, asset, requestedStart, requestedEn
   const durationMs = requestedEndDate.getTime() - requestedStartDate.getTime();
   const durationMins = Math.round(durationMs / (1000 * 60));
 
-  const alternativeTimes = [];
+  const candidateTimes = [];
 
   const sortedConflicts = [...conflicts].sort((a, b) =>
     new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
@@ -50,12 +95,11 @@ function generateConflictSuggestions(assetId, asset, requestedStart, requestedEn
   if (gapBefore >= durationMs) {
     const altEnd = new Date(firstConflictStart.getTime());
     const altStart = new Date(altEnd.getTime() - durationMs);
-    alternativeTimes.push({
+    candidateTimes.push({
       type: 'before_conflict',
       start_time: altStart.toISOString(),
       end_time: altEnd.toISOString(),
-      description: '冲突前可预约时段',
-      available: true
+      description: '冲突前可预约时段'
     });
   }
 
@@ -66,12 +110,11 @@ function generateConflictSuggestions(assetId, asset, requestedStart, requestedEn
     if (gap >= durationMs) {
       const altStart = new Date(currentEnd.getTime());
       const altEnd = new Date(altStart.getTime() + durationMs);
-      alternativeTimes.push({
+      candidateTimes.push({
         type: 'between_conflicts',
         start_time: altStart.toISOString(),
         end_time: altEnd.toISOString(),
-        description: '冲突间隔可预约时段',
-        available: true
+        description: '冲突间隔可预约时段'
       });
     }
   }
@@ -79,92 +122,98 @@ function generateConflictSuggestions(assetId, asset, requestedStart, requestedEn
   const lastConflictEnd = new Date(sortedConflicts[sortedConflicts.length - 1].end_time);
   const altStartAfter = new Date(lastConflictEnd.getTime());
   const altEndAfter = new Date(altStartAfter.getTime() + durationMs);
-  alternativeTimes.push({
+  candidateTimes.push({
     type: 'after_conflict',
     start_time: altStartAfter.toISOString(),
     end_time: altEndAfter.toISOString(),
-    description: '冲突后可预约时段',
-    available: true
+    description: '冲突后可预约时段'
   });
 
-  const nextDaySameTime = new Date(requestedStartDate);
-  nextDaySameTime.setDate(nextDaySameTime.getDate() + 1);
-  const nextDayEnd = new Date(nextDaySameTime.getTime() + durationMs);
-  alternativeTimes.push({
-    type: 'next_day_same_time',
-    start_time: nextDaySameTime.toISOString(),
-    end_time: nextDayEnd.toISOString(),
-    description: '次日同一时段（建议先校验可用性）',
-    available: null
-  });
+  for (let dayOffset = 1; dayOffset <= 3; dayOffset++) {
+    const nextDayStart = new Date(requestedStartDate);
+    nextDayStart.setDate(nextDayStart.getDate() + dayOffset);
+    const nextDayEnd = new Date(nextDayStart.getTime() + durationMs);
+    candidateTimes.push({
+      type: `next_${dayOffset}_day_same_time`,
+      start_time: nextDayStart.toISOString(),
+      end_time: nextDayEnd.toISOString(),
+      description: `后${dayOffset}天同一时段`
+    });
+  }
+
+  const alternativeTimes = [];
+  for (const candidate of candidateTimes) {
+    if (isTimeSlotAvailable(assetId, candidate.start_time, candidate.end_time)) {
+      alternativeTimes.push({
+        ...candidate,
+        available: true
+      });
+    }
+  }
 
   let alternativeAssets = [];
+  let deptNote = '';
   try {
     const dept = requestDepartment || asset.department;
-    let sameDeptAssets = [];
 
-    if (dept && dept !== '???' && dept.trim().length > 0) {
-      sameDeptAssets = all(`
+    if (!dept || dept === '???' || dept.trim().length === 0) {
+      deptNote = '申请部门信息不完整，无法推荐同部门资产';
+    } else {
+      const sameDeptAssets = all(`
         SELECT * FROM assets
         WHERE status NOT IN ('maintenance', 'disposed')
         AND id != ?
         AND department = ?
-        ORDER BY department, asset_code
-        LIMIT 10
+        ORDER BY asset_code
       `, [assetId, dept]);
-    }
 
-    if (sameDeptAssets.length === 0) {
-      sameDeptAssets = all(`
-        SELECT * FROM assets
-        WHERE status NOT IN ('maintenance', 'disposed')
-        AND id != ?
-        ORDER BY department, asset_code
-        LIMIT 10
-      `, [assetId]);
-    }
+      if (sameDeptAssets.length === 0) {
+        deptNote = `${dept} 下暂无其他可用资产`;
+      } else {
+        for (const altAsset of sameDeptAssets) {
+          const isAvailable = isTimeSlotAvailable(altAsset.id, requestedStart, requestedEnd);
+          if (isAvailable) {
+            alternativeAssets.push({
+              asset_id: altAsset.id,
+              asset_code: altAsset.asset_code,
+              name: altAsset.name,
+              category: altAsset.category,
+              department: altAsset.department,
+              status: altAsset.status,
+              available_in_requested_time: true,
+              is_same_department: true
+            });
+          }
+        }
 
-    for (const altAsset of sameDeptAssets) {
-      const altConflicts = all(`
-        SELECT 1 FROM reservations r
-        WHERE r.asset_id = ? AND r.status IN ('pending', 'approved')
-        AND r.start_time < ? AND r.end_time > ?
-        LIMIT 1
-      `, [altAsset.id, requestedEnd, requestedStart]);
-
-      alternativeAssets.push({
-        asset_id: altAsset.id,
-        asset_code: altAsset.asset_code,
-        name: altAsset.name,
-        category: altAsset.category,
-        department: altAsset.department,
-        status: altAsset.status,
-        available_in_requested_time: altConflicts.length === 0,
-        is_same_department: dept && altAsset.department === dept
-      });
-    }
-
-    alternativeAssets.sort((a, b) => {
-      if (a.available_in_requested_time !== b.available_in_requested_time) {
-        return a.available_in_requested_time ? -1 : 1;
+        if (alternativeAssets.length === 0) {
+          deptNote = `${dept} 下的资产在申请时段均已被占用`;
+        }
       }
-      if (a.is_same_department !== b.is_same_department) {
-        return a.is_same_department ? -1 : 1;
-      }
-      return 0;
-    });
+    }
   } catch (e) {
     console.error('查询替代资产失败:', e);
+    deptNote = '查询替代资产时发生错误';
+  }
+
+  const tips = [`当前申请时长: ${durationMins} 分钟`];
+  if (alternativeTimes.length > 0) {
+    tips.push(`推荐 ${alternativeTimes.length} 个可选时段，点击可直接预约`);
+  } else {
+    tips.push('近期暂无空时段，建议调整时长或延后预约');
+  }
+  if (alternativeAssets.length > 0) {
+    tips.push(`找到 ${alternativeAssets.length} 个同部门可用资产`);
+  } else if (deptNote) {
+    tips.push(deptNote);
   }
 
   return {
     requested_duration_minutes: durationMins,
     alternative_times: alternativeTimes.slice(0, 6),
     alternative_assets: alternativeAssets,
-    tips: [
-      `建议选择上述推荐时段或资产，也可调整预约时长（当前 ${durationMins} 分钟）`,
-      '点击推荐时段可直接尝试再次预约，二次提交前会重新校验可用性'
-    ]
+    dept_note: deptNote,
+    tips: tips
   };
 }
 
@@ -315,7 +364,7 @@ router.put('/:id/approve', (req, res) => {
   `, [newStatus, approved_by || null, id]);
 
   if (approved) {
-    updateAssetStatusByReservations(reservation.asset_id);
+    updateAssetStatusByReservations(reservation.asset_id, approved_by || 'system', id);
   }
 
   addLog(reservation.asset_id, approved ? 'approve' : 'reject', approved_by || 'system',
@@ -368,7 +417,7 @@ router.put('/:id/return', (req, res) => {
     WHERE id = ?
   `, [nowIso, return_remark || null, id]);
 
-  updateAssetStatusByReservations(reservation.asset_id);
+  updateAssetStatusByReservations(reservation.asset_id, operator || 'system', id);
 
   const remark = return_remark ? `，备注: ${return_remark}` : '';
   const lateRemark = isLate ? `，逾期归还（应还: ${reservation.end_time}）` : '';

@@ -72,7 +72,7 @@ router.post('/', (req, res) => {
   `, [id, asset_id, disposal_type, reason || null, applicant, department]);
 
   addLog(asset_id, 'disposal_request', applicant,
-    `发起${disposal_type === 'scrap' ? '报废' : '转让'}申请${reason ? '，原因: ' + reason : ''}`);
+    `发起${disposal_type === 'scrap' ? '报废' : '转让'}申请${reason ? '，原因: ' + reason : ''}，处置申请ID: ${id}`);
 
   const request = get('SELECT * FROM disposal_requests WHERE id = ?', [id]);
   res.status(201).json({ message: '处置申请提交成功', data: request });
@@ -137,7 +137,7 @@ router.put('/:id/approve', (req, res) => {
     run(`UPDATE assets SET status = 'disposed', updated_at = datetime('now') WHERE id = ?`, [request.asset_id]);
 
     addLog(request.asset_id, 'status_change', approved_by || 'system',
-      `状态变更: ${asset.status} -> disposed，原因: ${disposalName}处置${remark ? '，备注: ' + remark : ''}`);
+      `状态变更: ${asset.status} -> disposed，原因: ${disposalName}处置${remark ? '，备注: ' + remark : ''}，处置申请ID: ${id}`);
   }
 
   run(`
@@ -149,7 +149,7 @@ router.put('/:id/approve', (req, res) => {
   const disposalName = request.disposal_type === 'scrap' ? '报废' : '转让';
   addLog(request.asset_id, approved ? 'disposal_approved' : 'disposal_rejected',
     approved_by || 'system',
-    `处置${approved ? '通过' : '拒绝'}: ${disposalName}${remark ? '，备注: ' + remark : ''}`);
+    `处置${approved ? '通过' : '拒绝'}: ${disposalName}${remark ? '，备注: ' + remark : ''}，处置申请ID: ${id}`);
 
   const updated = get('SELECT * FROM disposal_requests WHERE id = ?', [id]);
   res.json({

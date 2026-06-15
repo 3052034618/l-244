@@ -145,13 +145,21 @@ router.get('/audit-trail', (req, res) => {
   if (event_type) {
     const typeMap = {
       'status_change': ['status_change'],
-      'reservation': ['reserve', 'approve', 'reject', 'return', 'cancel'],
+      'reservation': ['reserve', 'approve', 'reject', 'return', 'cancel', 'reservation_cancelled'],
       'maintenance': ['maintenance', 'maintenance_todo'],
-      'disposal': ['dispose']
+      'disposal': ['dispose', 'dispose_approve', 'disposal_request', 'disposal_approved', 'disposal_rejected']
     };
     const actions = typeMap[event_type];
     if (actions) {
-      sql += ` AND al.action IN (${actions.map(() => '?').join(', ')})`;
+      if (event_type === 'disposal') {
+        sql += ` AND (al.action IN (${actions.map(() => '?').join(', ')}) OR (al.action = 'status_change' AND al.detail LIKE '%处置%'))`;
+      } else if (event_type === 'reservation') {
+        sql += ` AND (al.action IN (${actions.map(() => '?').join(', ')}) OR (al.action = 'status_change' AND al.detail LIKE '%预约%'))`;
+      } else if (event_type === 'maintenance') {
+        sql += ` AND (al.action IN (${actions.map(() => '?').join(', ')}) OR (al.action = 'status_change' AND al.detail LIKE '%保养%'))`;
+      } else {
+        sql += ` AND al.action IN (${actions.map(() => '?').join(', ')})`;
+      }
       params.push(...actions);
     }
   }
@@ -174,6 +182,23 @@ router.get('/audit-trail', (req, res) => {
     const log = rawLogs[i];
     const m = log.detail && log.detail.match(/状态变更: (\w+) -> (\w+)/);
     if (m) {
+      let triggerType = null;
+      if (log.detail) {
+        if (log.detail.includes('保养') || log.detail.includes('maintenance')) triggerType = 'maintenance';
+        else if (log.detail.includes('处置') || log.detail.includes('dispose')) triggerType = 'disposal';
+        else if (log.detail.includes('预约') || log.detail.includes('审批') || log.detail.includes('归还')) triggerType = 'reservation';
+        else if (log.detail.includes('手动')) triggerType = 'manual';
+        else triggerType = 'system';
+      }
+
+      let relatedRecord = null;
+      let relatedRecordType = null;
+      const related = extractRelatedRecord(log, triggerType);
+      if (related.related_record) {
+        relatedRecord = related.related_record;
+        relatedRecordType = related.related_record_type;
+      }
+
       stateTransitions.unshift({
         log_id: log.id,
         from_status: m[1],
@@ -181,45 +206,48 @@ router.get('/audit-trail', (req, res) => {
         operator: log.operator,
         timestamp: log.created_at,
         reason: log.detail,
-        related_record: null,
-        related_record_type: null
+        trigger_type: triggerType,
+        related_record: relatedRecord,
+        related_record_type: relatedRecordType
       });
     }
   }
 
-  const enrichedLogs = rawLogs.map(log => {
-    const enriched = {
-      ...log,
-      event_category: classifyEvent(log.action),
-      related_record: null,
-      related_record_type: null,
-      status_change: null
-    };
+  function extractRelatedRecord(log, eventCategory) {
+    const result = { related_record: null, related_record_type: null };
 
-    const m = log.detail && log.detail.match(/状态变更: (\w+) -> (\w+)/);
-    if (m) {
-      enriched.status_change = {
-        from_status: m[1],
-        to_status: m[2]
-      };
-      enriched.event_category = 'status_change';
-    }
+    const idMatches = log.detail ? [...log.detail.matchAll(/([0-9a-fA-F-]{36})/g)] : [];
+    const ids = idMatches.map(m => m[1]).filter((v, i, a) => a.indexOf(v) === i);
 
-    if (enriched.event_category === 'reservation') {
-      const reservationIdMatch = log.detail && log.detail.match(/([0-9a-fA-F-]{36})/);
-      if (reservationIdMatch) {
-        const reservationId = reservationIdMatch[1];
+    for (const id of ids) {
+      if (eventCategory === 'reservation' || (eventCategory === 'status_change' && log.detail && (log.detail.includes('预约') || log.detail.includes('关联预约')))) {
         const reservation = get(`
           SELECT id, asset_id, applicant, department, purpose, start_time, end_time,
                  status, approved_by, approved_at, returned_at
           FROM reservations WHERE id = ?
-        `, [reservationId]);
+        `, [id]);
         if (reservation) {
-          enriched.related_record = reservation;
-          enriched.related_record_type = 'reservation';
+          result.related_record = reservation;
+          result.related_record_type = 'reservation';
+          return result;
         }
       }
-    } else if (enriched.event_category === 'maintenance') {
+
+      if (eventCategory === 'disposal' || (eventCategory === 'status_change' && log.detail && (log.detail.includes('处置') || log.detail.includes('处置申请ID')))) {
+        const disposal = get(`
+          SELECT id, asset_id, disposal_type, reason, applicant, department,
+                 status, approved_by, approved_at
+          FROM disposal_requests WHERE id = ?
+        `, [id]);
+        if (disposal) {
+          result.related_record = disposal;
+          result.related_record_type = 'disposal_request';
+          return result;
+        }
+      }
+    }
+
+    if (eventCategory === 'maintenance') {
       const maintenanceRecords = all(`
         SELECT id, asset_id, maintenance_type, mileage_at_maintenance, cost,
                content, next_date, next_mileage, performed_by, created_at
@@ -232,24 +260,33 @@ router.get('/audit-trail', (req, res) => {
           Math.abs(new Date(r.created_at).getTime() - new Date(log.created_at).getTime()) < 5000
         );
         if (matching) {
-          enriched.related_record = matching;
-          enriched.related_record_type = 'maintenance_record';
+          result.related_record = matching;
+          result.related_record_type = 'maintenance_record';
+          return result;
         }
       }
-    } else if (enriched.event_category === 'disposal') {
-      const disposalIdMatch = log.detail && log.detail.match(/([0-9a-fA-F-]{36})/);
-      if (disposalIdMatch) {
-        const disposalId = disposalIdMatch[1];
-        const disposal = get(`
-          SELECT id, asset_id, disposal_type, reason, applicant, department,
-                 status, approved_by, approved_at
-          FROM disposal_requests WHERE id = ?
-        `, [disposalId]);
-        if (disposal) {
-          enriched.related_record = disposal;
-          enriched.related_record_type = 'disposal_request';
-        }
-      }
+    }
+
+    return result;
+  }
+
+  const enrichedLogs = rawLogs.map(log => {
+    const eventCategory = classifyEvent(log.action);
+    const enriched = {
+      ...log,
+      event_category: eventCategory,
+      related_record: null,
+      related_record_type: null,
+      status_change: null,
+      trigger_type: null
+    };
+
+    const m = log.detail && log.detail.match(/状态变更: (\w+) -> (\w+)/);
+    if (m) {
+      enriched.status_change = {
+        from_status: m[1],
+        to_status: m[2]
+      };
     }
 
     if (enriched.event_category === 'status_change' && log.detail) {
@@ -263,6 +300,20 @@ router.get('/audit-trail', (req, res) => {
         enriched.trigger_type = 'manual';
       } else {
         enriched.trigger_type = 'system';
+      }
+    }
+
+    const related = extractRelatedRecord(log, eventCategory);
+    if (related.related_record) {
+      enriched.related_record = related.related_record;
+      enriched.related_record_type = related.related_record_type;
+    }
+
+    if (eventCategory === 'status_change' && enriched.trigger_type && !enriched.related_record) {
+      const related2 = extractRelatedRecord(log, enriched.trigger_type);
+      if (related2.related_record) {
+        enriched.related_record = related2.related_record;
+        enriched.related_record_type = related2.related_record_type;
       }
     }
 
@@ -295,9 +346,9 @@ router.get('/audit-trail', (req, res) => {
 
 function classifyEvent(action) {
   if (action === 'status_change') return 'status_change';
-  if (['reserve', 'approve', 'reject', 'return', 'cancel'].includes(action)) return 'reservation';
+  if (['reserve', 'approve', 'reject', 'return', 'cancel', 'reservation_cancelled'].includes(action)) return 'reservation';
   if (['maintenance', 'maintenance_todo'].includes(action)) return 'maintenance';
-  if (['dispose', 'dispose_approve'].includes(action)) return 'disposal';
+  if (['dispose', 'dispose_approve', 'disposal_request', 'disposal_approved', 'disposal_rejected'].includes(action)) return 'disposal';
   if (['register', 'update', 'voucher_upload'].includes(action)) return 'asset_info';
   return 'other';
 }
